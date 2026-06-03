@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: agpl-3.0
+//pragma solidity 0.8.7;
 
 import "./interfaces/IStakingPool.sol";
 import "./interfaces/IERC20.sol";
@@ -20,7 +21,7 @@ contract StakingMigratorGovernance {
         actualGovernance = _governance;
         baseToken = _baseToken;
         if (_customGracePeriod != 0) gracePeriod = _customGracePeriod;
-        else gracePeriod = block.timestamp + 30 days;
+        else gracePeriod = block.timestamp + 37 days;
         if (_customDeadline != 0) deadline = gracePeriod + _customDeadline;
         else deadline = gracePeriod + 90 days;
         if (_defaultMaxPromillesToBurn != 0)
@@ -75,7 +76,9 @@ contract StakingMigratorGovernance {
 
         token.approve(address(newPool), amountToMigrate);
         newPool.enterTo(msg.sender, amountToMigrate);
+		if(amountToBurn > 0) {
         token.transfer(address(0), amountToBurn); // Burn tokens
+		}
     }
 
     // needed because we appoint this contract as the sole governance of the StakingPool, so we need to be able to do arbitrary calls
