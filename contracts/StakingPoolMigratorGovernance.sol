@@ -8,8 +8,8 @@ contract StakingMigratorGovernance {
 	address public immutable baseToken;
 	uint256 public deadline;
 
-	constructor(address _baseToken, uint256 _customDeadline) {
-		actualGovernance = msg.sender;
+	constructor(address _baseToken, uint256 _customDeadline, address _governance) {
+		actualGovernance = _governance;
 		baseToken =_baseToken;
 		if (_customDeadline != 0) deadline = _customDeadline;
 		else deadline = block.timestamp + 90 days;
