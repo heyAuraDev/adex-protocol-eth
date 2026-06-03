@@ -6,24 +6,25 @@ import "./interfaces/IERC20.sol";
 contract StakingMigratorGovernance {
     address public immutable actualGovernance;
     address public immutable baseToken;
-    uint256 public gratisPeriod;
+    uint256 public gracePeriod;
     uint256 public deadline;
     uint256 public maxPromillesToBurn;
 
     constructor(
         address _baseToken,
         uint256 _customDeadline,
-        uint256 _customGratisPeriod,
+        uint256 _customGracePeriod,
         address _governance,
         uint256 _defaultMaxPromillesToBurn
     ) {
         actualGovernance = _governance;
         baseToken = _baseToken;
-        if (_customGratisPeriod != 0) gratisPeriod = _customGratisPeriod;
-        else gratisPeriod = block.timestamp + 30 days;
-        if (_customDeadline != 0) deadline = gratisPeriod + _customDeadline;
-        else deadline = gratisPeriod + 90 days;
-        if (_defaultMaxPromillesToBurn != 0) maxPromillesToBurn = _defaultMaxPromillesToBurn;
+        if (_customGracePeriod != 0) gracePeriod = _customGracePeriod;
+        else gracePeriod = block.timestamp + 30 days;
+        if (_customDeadline != 0) deadline = gracePeriod + _customDeadline;
+        else deadline = gracePeriod + 90 days;
+        if (_defaultMaxPromillesToBurn != 0)
+            maxPromillesToBurn = _defaultMaxPromillesToBurn;
         else maxPromillesToBurn = 200; // default max burn is 20%
     }
 
@@ -59,24 +60,25 @@ contract StakingMigratorGovernance {
         uint amountToMigrate = tokenAmount;
         uint amountToBurn = 0;
 
-        if (block.timestamp > gratisPeriod) {
+        if (block.timestamp > gracePeriod) {
             uint256 promillesToBurn = maxPromillesToBurn;
             if (block.timestamp < deadline) {
                 promillesToBurn =
-                    ((block.timestamp - gratisPeriod) * maxPromillesToBurn) /
-                    (deadline - gratisPeriod);
+                    ((block.timestamp - gracePeriod) * maxPromillesToBurn) /
+                    (deadline - gracePeriod);
             }
             amountToBurn = (tokenAmount * promillesToBurn) / 1000;
             amountToMigrate = tokenAmount - amountToBurn;
-            token.transfer(address(0), amountToBurn); // Burn tokens
         }
 
         require(amountToMigrate > 0, "nothing to migrate");
+
         token.approve(address(newPool), amountToMigrate);
         newPool.enterTo(msg.sender, amountToMigrate);
+        token.transfer(address(0), amountToBurn); // Burn tokens
     }
 
-   // needed because we appoint this contract as the sole governance of the StakingPool, so we need to be able to do arbitrary calls
+    // needed because we appoint this contract as the sole governance of the StakingPool, so we need to be able to do arbitrary calls
     function call(address to, bytes calldata data) external {
         require(msg.sender == actualGovernance, "is not governance");
         (bool success, bytes memory returnData) = to.call{value: 0}(data);
