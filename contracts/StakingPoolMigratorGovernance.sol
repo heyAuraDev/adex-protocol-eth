@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: agpl-3.0
-//pragma solidity 0.8.7;
+//pragma solidity 0.8.8;
 
 import "./interfaces/IStakingPool.sol";
 import "./interfaces/IERC20.sol";
@@ -21,7 +21,7 @@ contract StakingMigratorGovernance {
         actualGovernance = _governance;
         baseToken = _baseToken;
         if (_customGracePeriod != 0) gracePeriod = _customGracePeriod;
-        else gracePeriod = block.timestamp + 37 days;
+        else gracePeriod = block.timestamp + 32 days;
         if (_customDeadline != 0) deadline = gracePeriod + _customDeadline;
         else deadline = gracePeriod + 90 days;
         if (_defaultMaxPromillesToBurn != 0)
