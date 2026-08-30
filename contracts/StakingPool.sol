@@ -1,68 +1,57 @@
 // SPDX-License-Identifier: agpl-3.0
-pragma solidity 0.8.7;
+// pragma solidity 0.8.8;
 
 import "./interfaces/IADXToken.sol";
+import "./interfaces/IStakingPool.sol";
+import "./interfaces/IERC20.sol";
 
-interface IERCDecimals {
-	function decimals() external view returns (uint);
-}
-
-interface IChainlink {
-	// AUDIT: ensure this API is not deprecated
-	function latestAnswer() external view returns (uint);
-}
-
-// Full interface here: https://github.com/Uniswap/uniswap-v2-periphery/blob/master/contracts/interfaces/IUniswapV2Router01.sol
-interface IUniswapSimple {
-	function WETH() external pure returns (address);
-	function swapTokensForExactTokens(
-		uint amountOut,
-		uint amountInMax,
-		address[] calldata path,
-		address to,
-		uint deadline
-	) external returns (uint[] memory amounts);
-}
-
-contract StakingPool {
+contract StakingPool is IStakingPool, IERC20 {
 	// ERC20 stuff
 	// Constants
-	string public constant name = "AdEx Staking Token";
+	string public constant name = "AdEx Staking Token v2";
 	uint8 public constant decimals = 18;
-	string public constant symbol = "ADX-STAKING";
+	string public constant symbol = "stkADX";
 
 	// Mutable variables
-	uint public totalSupply;
-	mapping(address => uint) private balances;
+	uint public totalShares;
+	mapping(address => uint) public shares;
 	mapping(address => mapping(address => uint)) private allowed;
-
 	// EIP 2612
 	bytes32 public DOMAIN_SEPARATOR;
 	// keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
 	bytes32 public constant PERMIT_TYPEHASH = 0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9;
 	mapping(address => uint) public nonces;
 
-	// ERC20 events
-	event Approval(address indexed owner, address indexed spender, uint amount);
-	event Transfer(address indexed from, address indexed to, uint amount);
-
 	// ERC20 methods
 	function balanceOf(address owner) external view returns (uint balance) {
-		return balances[owner];
+		return (shares[owner] * this.shareValue()) / 1e18;
+	}
+
+	function totalSupply() external view returns (uint total) {
+		return IERC20(baseToken).balanceOf(address(this)) + IADXToken(baseToken).supplyController().mintableIncentive(address(this));
 	}
 
 	function transfer(address to, uint amount) external returns (bool success) {
-		require(to != address(this), "BAD_ADDRESS");
-		balances[msg.sender] = balances[msg.sender] - amount;
-		balances[to] = balances[to] + amount;
+		require(to != address(this), "cannot send to contract");
+		require(commitments[msg.sender].shareAmount == 0, "unstaking in progress");
+		uint shareAmount = (amount * 1e18) / this.shareValue();
+		require(shareAmount > 0, "trying to transfer zero shares");
+		shares[msg.sender] = shares[msg.sender] - shareAmount;
+		shares[to] = shares[to] + shareAmount;
 		emit Transfer(msg.sender, to, amount);
 		return true;
 	}
 
 	function transferFrom(address from, address to, uint amount) external returns (bool success) {
-		balances[from] = balances[from] - amount;
-		allowed[from][msg.sender] = allowed[from][msg.sender] - amount;
-		balances[to] = balances[to] + amount;
+		require(to != address(this), "cannot send to contract");
+		require(commitments[from].shareAmount == 0, "unstaking in progress");
+		uint _shareValue = this.shareValue();
+		uint256 shareAmount = (amount * 1e18) / _shareValue;
+		require(shareAmount > 0, "trying to transfer zero shares");
+		shares[from] = shares[from] - shareAmount;
+		uint256 prevAllowance = allowed[from][msg.sender];
+		if (prevAllowance < type(uint256).max) allowed[from][msg.sender] = prevAllowance - (shareAmount * _shareValue) / 1e18;
+		shares[to] = shares[to] + shareAmount;
 		emit Transfer(from, to, amount);
 		return true;
 	}
@@ -92,67 +81,41 @@ contract StakingPool {
 	}
 
 	// Inner
-	function innerMint(address owner, uint amount) internal {
-		totalSupply = totalSupply + amount;
-		balances[owner] = balances[owner] + amount;
-		// Because of https://github.com/ethereum/EIPs/blob/master/EIPS/eip-20.md#transfer-1
-		emit Transfer(address(0), owner, amount);
+	function mintShares(address owner, uint shareAmount) internal {
+		totalShares = totalShares + shareAmount;
+		shares[owner] = shares[owner] + shareAmount;
 	}
-	function innerBurn(address owner, uint amount) internal {
-		totalSupply = totalSupply - amount;
-		balances[owner] = balances[owner] - amount;
-		emit Transfer(owner, address(0), amount);
+	function burnShares(address owner, uint shareAmount) internal {
+		totalShares = totalShares - shareAmount;
+		shares[owner] = shares[owner] - shareAmount;
 	}
 
 	// Pool functionality
-	uint public timeToUnbond = 20 days;
+	uint public timeToUnbond = 60 days;
 	uint public rageReceivedPromilles = 700;
 
-	IUniswapSimple public uniswap; // = IUniswapSimple(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
-	IChainlink public ADXUSDOracle; // = IChainlink(0x231e764B44b2C1b7Ca171fa8021A24ed520Cde10);
-
-	IADXToken public immutable ADXToken;
-	address public guardian;
-	address public validator;
+	address public immutable baseToken;
 	address public governance;
 
-	// claim token whitelist: normally claim tokens are stablecoins
-	// eg Tether (0xdAC17F958D2ee523a2206206994597C13D831ec7)
-	mapping (address => bool) public whitelistedClaimTokens;
-
-	// Commitment ID against the max amount of tokens it will pay out
-	mapping (bytes32 => uint) public commitments;
-	// How many of a user's shares are locked
-	mapping (address => uint) public lockedShares;
+	// Each user can only have one unbonding committment at a time
+	mapping (address => UnbondCommitment) public commitments;
+	mapping (address => uint) public individualTimeToUnbond;
 	// Unbonding commitment from a staker
 	struct UnbondCommitment {
-		address owner;
-		uint shares;
+		uint shareAmount;
+		uint tokensToReceive;
 		uint unlocksAt;
 	}
 
-	// claims/penalizations limits
-	uint public maxDailyPenaltiesPromilles;
-	uint public limitLastReset;
-	uint public limitRemaining;
-
 	// Staking pool events
 	// LogLeave/LogWithdraw must begin with the UnbondCommitment struct
-	event LogLeave(address indexed owner, uint shares, uint unlocksAt, uint maxTokens);
-	event LogWithdraw(address indexed owner, uint shares, uint unlocksAt, uint maxTokens, uint receivedTokens);
-	event LogRageLeave(address indexed owner, uint shares, uint maxTokens, uint receivedTokens);
-	event LogNewGuardian(address newGuardian);
-	event LogClaim(address tokenAddr, address to, uint amountInUSD, uint burnedValidatorShares, uint usedADX, uint totalADX, uint totalShares);
-	event LogPenalize(uint burnedADX);
+	event LogLeave(address indexed owner, uint shareAmount, uint unlocksAt, uint maxTokens);
+	event LogWithdraw(address indexed owner, uint shareAmount, uint unlocksAt, uint maxTokens, uint receivedTokens);
+	event LogRageLeave(address indexed owner, uint shareAmount, uint maxTokens, uint receivedTokens);
 
-	constructor(IADXToken token, IUniswapSimple uni, IChainlink oracle, address guardianAddr, address validatorStakingWallet, address governanceAddr, address claimToken) {
-		ADXToken = token;
-		uniswap = uni;
-		ADXUSDOracle = oracle;
-		guardian = guardianAddr;
-		validator = validatorStakingWallet;
+	constructor(IADXToken token, address governanceAddr) {
+		baseToken = address(token);
 		governance = governanceAddr;
-		whitelistedClaimTokens[claimToken] = true;
 
 		// EIP 2612
 		uint chainId;
@@ -175,12 +138,6 @@ contract StakingPool {
 		require(governance == msg.sender, "NOT_GOVERNANCE");
 		governance = addr;
 	}
-	function setDailyPenaltyMax(uint max) external {
-		require(governance == msg.sender, "NOT_GOVERNANCE");
-		require(max <= 200, "DAILY_PENALTY_TOO_LARGE");
-		maxDailyPenaltiesPromilles = max;
-		resetLimits();
-	}
 	function setRageReceived(uint rageReceived) external {
 		require(governance == msg.sender, "NOT_GOVERNANCE");
 		// AUDIT: should there be a minimum here?
@@ -189,178 +146,114 @@ contract StakingPool {
 	}
 	function setTimeToUnbond(uint time) external {
 		require(governance == msg.sender, "NOT_GOVERNANCE");
-		require(time >= 1 days && time <= 30 days, "BOUNDS");
+		require(time >= 1 days && time <= 365 days, "BOUNDS");
 		timeToUnbond = time;
-	}
-	function setGuardian(address newGuardian) external {
-		require(governance == msg.sender, "NOT_GOVERNANCE");
-		guardian = newGuardian;
-		emit LogNewGuardian(newGuardian);
-	}
-	function setWhitelistedClaimToken(address token, bool whitelisted) external {
-		require(governance == msg.sender, "NOT_GOVERNANCE");
-		whitelistedClaimTokens[token] = whitelisted;
 	}
 
 	// Pool stuff
 	function shareValue() external view returns (uint) {
-		if (totalSupply == 0) return 0;
-		return ((ADXToken.balanceOf(address(this)) + ADXToken.supplyController().mintableIncentive(address(this)))
+		if (totalShares == 0) return 0;
+		return (this.totalSupply()
 			* 1e18)
-			/ totalSupply;
+			/ totalShares;
 	}
 
 	function innerEnter(address recipient, uint amount) internal {
 		// Please note that minting has to be in the beginning so that we take it into account
-		// when using ADXToken.balanceOf()
-		// Minting makes an external call but it"s to a trusted contract (ADXToken)
-		ADXToken.supplyController().mintIncentive(address(this));
+		// when using IADXToken(baseToken).balanceOf()
+		// Minting makes an external call but it's to a trusted contract (ADXToken)
+		IADXToken(baseToken).supplyController().mintIncentive(address(this));
 
-		uint totalADX = ADXToken.balanceOf(address(this));
+		uint totalADX = IERC20(baseToken).balanceOf(address(this));
 
-		// The totalADX == 0 check here should be redudnant; the only way to get totalSupply to a nonzero val is by adding ADX
-		if (totalSupply == 0 || totalADX == 0) {
-			innerMint(recipient, amount);
+		// The totalADX == 0 check here should be redudnant; the only way to get totalShares to a nonzero val is by adding ADX
+		if (totalShares == 0 || totalADX == 0) {
+			mintShares(recipient, amount);
 		} else {
-			uint256 newShares = (amount * totalSupply) / totalADX;
-			innerMint(recipient, newShares);
+			uint256 newShares = (amount * totalShares) / totalADX;
+			mintShares(recipient, newShares);
 		}
-		require(ADXToken.transferFrom(msg.sender, address(this), amount));
-		// no events, as innerMint already emits enough to know the shares amount and price
+		require(IERC20(baseToken).transferFrom(msg.sender, address(this), amount));
+		// @TODO: perhaps emit the share value here too
+		// Because of https://github.com/ethereum/EIPs/blob/master/EIPS/eip-20.md#transfer-1
+		emit Transfer(address(0), recipient, amount);
 	}
 
 	function enter(uint amount) external {
 		innerEnter(msg.sender, amount);
 	}
 
+	// not allowed for enterTo because it would be unfair to set somebody else's time
+	function enterWithUnbondTime(uint amount, uint time) external {
+		require(time >= individualTimeToUnbond[msg.sender] || shares[msg.sender] == 0, "you cannot reduce individual time to unbond unless you have zero stake");
+		individualTimeToUnbond[msg.sender] = time;
+		// This method can be invoked with zero amount, just to adjust time
+		if (amount > 0) innerEnter(msg.sender, amount);
+	}
+
 	function enterTo(address recipient, uint amount) external {
 		innerEnter(recipient, amount);
 	}
 
-	function unbondingCommitmentWorth(address owner, uint shares, uint unlocksAt) external view returns (uint) {
-		if (totalSupply == 0) return 0;
-		bytes32 commitmentId = keccak256(abi.encode(UnbondCommitment({ owner: owner, shares: shares, unlocksAt: unlocksAt })));
-		uint maxTokens = commitments[commitmentId];
-		uint totalADX = ADXToken.balanceOf(address(this));
-		uint currentTokens = (shares * totalADX) / totalSupply;
-		return currentTokens > maxTokens ? maxTokens : currentTokens;
+	function unstake(uint shareAmount, bool skipMint) external {
+		if (!skipMint) IADXToken(baseToken).supplyController().mintIncentive(address(this));
+
+		require(shareAmount > 0, "shareAmount must be greater than 0");
+		require(commitments[msg.sender].shareAmount == 0, "unstaking already in progress");
+		require(shareAmount <= shares[msg.sender], "insufficient shares");
+
+		uint totalBase = IERC20(baseToken).balanceOf(address(this));
+		uint unbondTime = individualTimeToUnbond[msg.sender] > timeToUnbond ? individualTimeToUnbond[msg.sender] : timeToUnbond;
+
+		commitments[msg.sender] = UnbondCommitment({
+			tokensToReceive: (shareAmount * totalBase) / totalShares,
+			unlocksAt: block.timestamp + unbondTime,
+			shareAmount: shareAmount
+		});
+
+		emit LogLeave(msg.sender, shareAmount, commitments[msg.sender].unlocksAt, commitments[msg.sender].tokensToReceive);
 	}
 
-	function leave(uint shares, bool skipMint) external {
-		if (!skipMint) ADXToken.supplyController().mintIncentive(address(this));
+	function withdraw(bool skipMint) external {
+		if (!skipMint) IADXToken(baseToken).supplyController().mintIncentive(address(this));
 
-		require(shares <= balances[msg.sender] - lockedShares[msg.sender], "INSUFFICIENT_SHARES");
-		uint totalADX = ADXToken.balanceOf(address(this));
-		uint maxTokens = (shares * totalADX) / totalSupply;
-		uint unlocksAt = block.timestamp + timeToUnbond;
-		bytes32 commitmentId = keccak256(abi.encode(UnbondCommitment({ owner: msg.sender, shares: shares, unlocksAt: unlocksAt })));
-		require(commitments[commitmentId] == 0, "COMMITMENT_EXISTS");
+		uint shareAmount = commitments[msg.sender].shareAmount;
+		require(shareAmount > 0, "no unbonding committment");
 
-		commitments[commitmentId] = maxTokens;
-		lockedShares[msg.sender] += shares;
+		uint unlocksAt = commitments[msg.sender].unlocksAt;
+		require(block.timestamp > unlocksAt, "too early to withdraw");
 
-		emit LogLeave(msg.sender, shares, unlocksAt, maxTokens);
-	}
-
-	function withdraw(uint shares, uint unlocksAt, bool skipMint) external {
-		if (!skipMint) ADXToken.supplyController().mintIncentive(address(this));
-
-		require(block.timestamp > unlocksAt, "UNLOCK_TOO_EARLY");
-		bytes32 commitmentId = keccak256(abi.encode(UnbondCommitment({ owner: msg.sender, shares: shares, unlocksAt: unlocksAt })));
-		uint maxTokens = commitments[commitmentId];
-		require(maxTokens > 0, "NO_COMMITMENT");
-		uint totalADX = ADXToken.balanceOf(address(this));
-		uint currentTokens = (shares * totalADX) / totalSupply;
+		// This math only exists in case the pool goes DOWN in total tokens,
+		// otherwise we can simply use .tokensToReceive
+		uint maxTokens = commitments[msg.sender].tokensToReceive;
+		uint totalBase = IERC20(baseToken).balanceOf(address(this));
+		uint currentTokens = (shareAmount * totalBase) / totalShares;
 		uint receivedTokens = currentTokens > maxTokens ? maxTokens : currentTokens;
 
-		commitments[commitmentId] = 0;
-		lockedShares[msg.sender] -= shares;
+		burnShares(msg.sender, shareAmount);
+		commitments[msg.sender] = UnbondCommitment({ unlocksAt: 0, tokensToReceive: 0, shareAmount: 0 });
 
-		innerBurn(msg.sender, shares);
-		require(ADXToken.transfer(msg.sender, receivedTokens));
+		require(IERC20(baseToken).transfer(msg.sender, receivedTokens), "base token transfer failed");
 
-		emit LogWithdraw(msg.sender, shares, unlocksAt, maxTokens, receivedTokens);
+		emit Transfer(msg.sender, address(0), currentTokens);
+		emit LogWithdraw(msg.sender, shareAmount, unlocksAt, maxTokens, receivedTokens);
 	}
 
-	function rageLeave(uint shares, bool skipMint) external {
-		if (!skipMint) ADXToken.supplyController().mintIncentive(address(this));
+	function rageLeave(uint shareAmount, bool skipMint) external {
+		if (!skipMint) IADXToken(baseToken).supplyController().mintIncentive(address(this));
 
-		uint totalADX = ADXToken.balanceOf(address(this));
-		uint adxAmount = (shares * totalADX) / totalSupply;
-		uint receivedTokens = (adxAmount * rageReceivedPromilles) / 1000;
-		innerBurn(msg.sender, shares);
-		require(ADXToken.transfer(msg.sender, receivedTokens));
+		uint totalBase = IERC20(baseToken).balanceOf(address(this));
+		uint currentTokens = (shareAmount * totalBase) / totalShares;
+		uint receivedTokens = (currentTokens * rageReceivedPromilles) / 1000;
+		burnShares(msg.sender, shareAmount);
+		require(IERC20(baseToken).transfer(msg.sender, receivedTokens), "base token transfer failed");
 
-		emit LogRageLeave(msg.sender, shares, adxAmount, receivedTokens);
-	}
-
-	// Insurance mechanism
-	// In case something goes wrong, this can be used to recoup funds
-	// As of V5, the idea is to use it to provide some interest (eg 10%) for late refunds, in case channels get stuck and have to wait through their challenge period
-	function claim(address tokenOut, address to, uint amount) external {
-		require(msg.sender == guardian, 'NOT_GUARDIAN');
-    
-		// start by resetting claim/penalty limits
-		resetLimits();
-
-		// NOTE: minting is intentionally skipped here
-		// This means that a validator may be punished a bit more when burning their shares,
-		// but it guarantees that claim() always works
-		uint totalADX = ADXToken.balanceOf(address(this));
-
-		// Note: whitelist of tokenOut tokens
-		require(whitelistedClaimTokens[tokenOut], "TOKEN_NOT_WHITELISTED");
-
-		address[] memory path = new address[](3);
-		path[0] = address(ADXToken);
-		path[1] = uniswap.WETH();
-		path[2] = tokenOut;
-
-		// You may think the Uniswap call enables reentrancy, but reentrancy is a problem only if the pattern is check-call-modify, not call-check-modify as is here
-		// there"s no case in which we "double-spend" a value
-		// Plus, ADX, USDT and uniswap are all trusted
-
-		// Slippage protection; 5% slippage allowed
-		uint price = ADXUSDOracle.latestAnswer();
-		// chainlink price is in 1e8
-		// for example, if the amount is in 1e6;
-		// we need to convert from 1e6 to 1e18 (adx) but we divide by 1e8 (price); 18 - 6 + 8 ; verified this by calculating manually
-		uint multiplier = 1.05e26 / (10 ** IERCDecimals(tokenOut).decimals());
-		uint adxAmountMax = (amount * multiplier) / price;
-		require(adxAmountMax < totalADX, "INSUFFICIENT_ADX");
-		uint[] memory amounts = uniswap.swapTokensForExactTokens(amount, adxAmountMax, path, to, block.timestamp);
-
-		// calculate the total ADX amount used in the swap
-		uint adxAmountUsed = amounts[0];
-
-		// burn the validator shares so that they pay for it first, before dilluting other holders
-		// calculate the worth in ADX of the validator"s shares
-		uint sharesNeeded = (adxAmountUsed * totalSupply) / totalADX;
-		uint toBurn = sharesNeeded < balances[validator] ? sharesNeeded : balances[validator];
-		if (toBurn > 0) innerBurn(validator, toBurn);
-
-		// Technically redundant cause we"ll fail on the subtraction, but we"re doing this for better err msgs
-		require(limitRemaining >= adxAmountUsed, "LIMITS");
-		limitRemaining -= adxAmountUsed;
-
-		emit LogClaim(tokenOut, to, amount, toBurn, adxAmountUsed, totalADX, totalSupply);
-	}
-
-	function penalize(uint adxAmount) external {
-		require(msg.sender == guardian, "NOT_GUARDIAN");
-		// AUDIT: we can do getLimitRemaining() instead of resetLimits() that returns the remaining limit
-		resetLimits();
-		// Technically redundant cause we'll fail on the subtraction, but we're doing this for better err msgs
-		require(limitRemaining >= adxAmount, "LIMITS");
-		limitRemaining -= adxAmount;
-		require(ADXToken.transfer(address(0), adxAmount));
-		emit LogPenalize(adxAmount);
-	}
-
-	function resetLimits() internal {
-		if (block.timestamp - limitLastReset > 24 hours) {
-			limitLastReset = block.timestamp;
-			limitRemaining = (ADXToken.balanceOf(address(this)) * maxDailyPenaltiesPromilles) / 1000;
+		if (commitments[msg.sender].shareAmount > shares[msg.sender]) {
+			// reset that user's committment, otherwise they end up bricked until they deposit more tokens
+			commitments[msg.sender] = UnbondCommitment({ unlocksAt: 0, tokensToReceive: 0, shareAmount: 0 });
 		}
+
+		emit Transfer(msg.sender, address(0), currentTokens);
+		emit LogRageLeave(msg.sender, shareAmount, currentTokens, receivedTokens);
 	}
 }
