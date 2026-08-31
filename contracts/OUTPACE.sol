@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: agpl-3.0
-pragma solidity 0.8.7;
+pragma solidity 0.8.19;
 
 import "./libs/SafeERC20.sol";
 import "./libs/MerkleProof.sol";
@@ -88,7 +88,7 @@ contract OUTPACE {
 		if (challengeExpirationTime != 0) lastStateRoot[channelId] = withdrawal.stateRoot;
 
 		// Check the signatures
-		bytes32 hashToSign = keccak256(abi.encode(address(this), channelId, withdrawal.stateRoot));
+		bytes32 hashToSign = keccak256(abi.encode(address(this), channelId, withdrawal.stateRoot, block.chainid));
 		require(SignatureValidator.isValid(hashToSign, withdrawal.channel.leader, withdrawal.sigLeader), 'LEADER_SIG');
 		require(SignatureValidator.isValid(hashToSign, withdrawal.channel.follower, withdrawal.sigFollower), 'FOLLOWER_SIG');
 		// adds like 8k gas for 10 withdrawals (2% increase)
@@ -128,7 +128,7 @@ contract OUTPACE {
 		uint challengeExpires = challenges[channelId];
 		require(challengeExpires != 0 && challengeExpires != CLOSED, 'CHANNEL_NOT_CHALLENGED');
 		// NOTE: we can resume the channel by mutual consent even if it's closable, so we won't check whether challengeExpires is in the future
-		bytes32 hashToSign = keccak256(abi.encodePacked('resume', channelId, challengeExpires));
+		bytes32 hashToSign = keccak256(abi.encodePacked('resume', channelId, challengeExpires, block.chainid));
 		require(SignatureValidator.isValid(hashToSign, channel.leader, sigLeader), 'INVALID_LEADER_SIG');
 		require(SignatureValidator.isValid(hashToSign, channel.follower, sigFollower), 'INVALID_FOLLOWER_SIG');
 
